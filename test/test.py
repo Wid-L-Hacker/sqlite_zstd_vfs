@@ -319,6 +319,7 @@ import sys
 import time
 
 build, dbfn, vfs, sync, shape = sys.argv[1:6]
+extra = sys.argv[6] if len(sys.argv) > 6 else ""
 con0 = sqlite3.connect(":memory:")
 con0.enable_load_extension(True)
 con0.load_extension(os.path.join(build, vfs + "_vfs"))
@@ -330,6 +331,23 @@ if shape in ("commits", "exclusive"):
     con.execute("CREATE TABLE t (x INTEGER)")
     for v in (1, 2, 3):
         con.execute("INSERT INTO t VALUES (?)", (v,))
+elif shape == "stages":
+    # one commit per synchronous level, in sequence: FULL, then OFF, then NORMAL;
+    # `extra` says how many of the stages to perform before idling
+    con.execute("CREATE TABLE t (x TEXT)")
+    for stage, level in enumerate(("FULL", "OFF", "NORMAL"), start=1):
+        if stage > int(extra):
+            break
+        con.execute(f"PRAGMA synchronous={level}")
+        con.execute("INSERT INTO t VALUES (?)", (level.lower(),))
+elif shape == "query":
+    # bare `PRAGMA synchronous` queries interleaved with OFF commits must answer
+    # with the inner level and disturb nothing
+    assert next(con.execute("PRAGMA synchronous"))[0] == 0
+    con.execute("CREATE TABLE t (x INTEGER)")
+    con.execute("INSERT INTO t VALUES (1)")
+    assert next(con.execute("PRAGMA synchronous"))[0] == 0
+    con.execute("INSERT INTO t VALUES (2)")
 elif shape == "midtxn":
     con.execute("CREATE TABLE t (x TEXT)")
     con.execute("INSERT INTO t VALUES ('committed')")
@@ -342,15 +360,15 @@ while True:
 """
 
 
-def _spawn_sync_child(tmpdir, vfs, sync, shape):
-    dbfn = str(tmpdir.join(f"sync_{vfs}_{sync}_{shape}.db"))
+def _spawn_sync_child(tmpdir, vfs, sync, shape, extra=""):
+    dbfn = str(tmpdir.join(f"sync_{vfs}_{sync}_{shape}{extra}.db"))
     child_py = str(tmpdir.join("sync_kill_child.py"))
     with open(child_py, "w") as out:
         out.write(_SYNC_KILL_CHILD)
     errfn = str(tmpdir.join("sync_kill_child.err"))
     with open(errfn, "wb") as err:
         proc = subprocess.Popen(
-            [sys.executable, child_py, BUILD, dbfn, vfs, sync, shape],
+            [sys.executable, child_py, BUILD, dbfn, vfs, sync, shape, extra],
             stdout=subprocess.PIPE,
             stderr=err,
             text=True,
@@ -446,6 +464,70 @@ def test_sync_off_exclusive_locking_takes_effect_at_close(tmpdir):
     con = _connect_vfs(dbfn, "nested")
     assert next(con.execute("PRAGMA integrity_check"))[0] == "ok"
     assert [r[0] for r in con.execute("SELECT x FROM t ORDER BY x")] == [1, 2, 3]
+    con.close()
+
+
+@pytest.mark.parametrize("vfs", ["nested", "zstd"])
+@pytest.mark.parametrize("sync", ["FULL", "EXTRA", "0", "3"])
+def test_sync_level_commits_survive_process_kill(tmpdir, vfs, sync):
+    # the remaining synchronous levels (keyword and numeric forms alike) commit
+    # per transaction just as OFF and NORMAL do
+    proc, dbfn = _spawn_sync_child(tmpdir, vfs, sync, "commits")
+    _kill(proc)
+    con = _connect_vfs(dbfn, vfs)
+    assert next(con.execute("PRAGMA integrity_check"))[0] == "ok"
+    assert [r[0] for r in con.execute("SELECT x FROM t ORDER BY x")] == [1, 2, 3]
+    con.close()
+
+
+@pytest.mark.parametrize("vfs", ["nested", "zstd"])
+@pytest.mark.parametrize(
+    "through,expected",
+    [(1, ["full"]), (2, ["full", "off"]), (3, ["full", "off", "normal"])],
+)
+def test_sync_level_changes_survive_process_kill(tmpdir, vfs, through, expected):
+    # changing the level mid-connection (FULL, then OFF, then NORMAL) leaves each
+    # stage's commit in effect when the process dies after that stage
+    proc, dbfn = _spawn_sync_child(tmpdir, vfs, "FULL", "stages", str(through))
+    _kill(proc)
+    con = _connect_vfs(dbfn, vfs)
+    assert next(con.execute("PRAGMA integrity_check"))[0] == "ok"
+    assert [r[0] for r in con.execute("SELECT x FROM t")] == expected
+    con.close()
+
+
+@pytest.mark.parametrize("vfs", ["nested", "zstd"])
+def test_sync_bare_query_disturbs_nothing(tmpdir, vfs):
+    # a bare `PRAGMA synchronous` query between OFF commits answers with the
+    # inner level (the core, not the VFS, handles it) and the commits around
+    # it survive process death as usual
+    proc, dbfn = _spawn_sync_child(tmpdir, vfs, "OFF", "query")
+    _kill(proc)
+    con = _connect_vfs(dbfn, vfs)
+    assert next(con.execute("PRAGMA integrity_check"))[0] == "ok"
+    assert [r[0] for r in con.execute("SELECT x FROM t ORDER BY x")] == [1, 2]
+    con.close()
+
+
+@pytest.mark.parametrize("vfs", ["nested", "zstd"])
+def test_sync_levels_with_outer_unsafe(tmpdir, vfs):
+    # outer_unsafe=1 is the caller's wholesale opt-out for the outer database;
+    # inner synchronous changes and queries proceed normally alongside it, and
+    # everything is in place after a clean close
+    dbfn = str(tmpdir.join(f"sync_{vfs}_unsafe.db"))
+    con0 = sqlite3.connect(":memory:")
+    con0.enable_load_extension(True)
+    con0.load_extension(os.path.join(BUILD, vfs + "_vfs"))
+    con = sqlite3.connect(f"file:{dbfn}?vfs={vfs}&outer_unsafe=1", uri=True, isolation_level=None)
+    con.execute("CREATE TABLE t (x INTEGER)")
+    for v, level in enumerate(("FULL", "OFF", "NORMAL", "EXTRA")):
+        con.execute(f"PRAGMA synchronous={level}")
+        con.execute("INSERT INTO t VALUES (?)", (v,))
+    assert next(con.execute("PRAGMA synchronous"))[0] == 3
+    con.close()
+    con = _connect_vfs(dbfn, vfs)
+    assert next(con.execute("PRAGMA integrity_check"))[0] == "ok"
+    assert [r[0] for r in con.execute("SELECT x FROM t ORDER BY x")] == [0, 1, 2, 3]
     con.close()
 
 

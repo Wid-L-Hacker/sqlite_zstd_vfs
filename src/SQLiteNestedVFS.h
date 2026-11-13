@@ -61,6 +61,9 @@ class InnerDatabaseFile : public SQLiteVFS::File {
     std::unique_ptr<SQLite::Database> outer_db_;
     std::string inner_db_pages_table_;
     bool read_only_, web_;
+    // Whether the outer connection was opened with outer_unsafe=1, read from the same URI
+    // the VFS Open() reads it from (see ApplyInnerSynchronous).
+    const bool outer_unsafe_;
 
     std::string btree_interior_index_;
 
@@ -612,10 +615,47 @@ class InnerDatabaseFile : public SQLiteVFS::File {
     // Retain write-path history across Sync(): connections that never called begin()
     // freed no outer pages and need not vacuum at close.
     bool wrote_ = false;
+
+    // The inner connection's PRAGMA synchronous level, as shadowed by FileControl, and the
+    // level last asserted on the outer connection (-1 for neither yet). begin() flows the
+    // former through to the latter, so each outer commit takes the inner level's cost and
+    // durability instead of the outer connection's fixed default.
+    int inner_synchronous_ = -1, outer_synchronous_ = -1;
+    // Whether the inner pager holds this file's lock -- one of this file's two signs of an
+    // open inner transaction, consulted by FileControl (the other is txn_ above).
+    bool inner_lock_held_ = false;
+
+    // Assert the shadowed inner synchronous level on the outer connection, if it isn't
+    // already in effect there. Called from begin(), just before the outer transaction
+    // opens: the core forbids changing synchronous inside a transaction, and Sync() runs
+    // with the outer transaction already open, so the transaction's opening is the one
+    // point preceding every commit of it (Sync(), the Unlock() commit, and Close() commit
+    // only what begin() opened).
+    //
+    // No coordination with other connections is needed. A writer on the outer database
+    // excludes all other connections for its connection's lifetime, so commits on one outer
+    // connection are never interleaved with another writer's; each outer connection asserts
+    // its own inner connection's level as its transactions begin, and sequential writers
+    // each get their level at their own commits -- the same rule native SQLite applies,
+    // where an acknowledged commit's durability follows the committing connection's
+    // setting at commit time.
+    void ApplyInnerSynchronous() {
+        // With outer_unsafe_, the outer connection already runs synchronous=OFF with its
+        // journal off -- the caller's wholesale opt-out of outer transaction safety -- and
+        // flow-through leaves it exactly as opened.
+        if (outer_unsafe_ || inner_synchronous_ < 0 || inner_synchronous_ == outer_synchronous_) {
+            return;
+        }
+        outer_db_->exec(std::string("PRAGMA synchronous=") +
+                        SynchronousLevelName(inner_synchronous_));
+        outer_synchronous_ = inner_synchronous_;
+    }
+
     void begin() {
         assert(!read_only_);
         wrote_ = true;
         if (!txn_) {
+            ApplyInnerSynchronous();
             txn_.reset(new SQLite::Transaction(*outer_db_));
         }
     }
@@ -975,6 +1015,7 @@ class InnerDatabaseFile : public SQLiteVFS::File {
         EXCLUSIVE to SHARED upon txn commit, rather than releasing entirely. Testing of all this
         will be tricky, so we've punted on it for now.
         */
+        inner_lock_held_ = true;
         return SQLITE_OK;
     }
     int Unlock(int eLock) override {
@@ -996,6 +1037,7 @@ class InnerDatabaseFile : public SQLiteVFS::File {
             }
         }
         if (eLock == SQLITE_LOCK_NONE) {
+            inner_lock_held_ = false;
             // wipe internal state that's liable to go stale after relinquishing read lock
             page_count_ = 0;
             try {
@@ -1011,7 +1053,51 @@ class InnerDatabaseFile : public SQLiteVFS::File {
         *pResOut = 0;
         return SQLITE_OK;
     }
-    int FileControl(int op, void *pArg) override { return SQLITE_NOTFOUND; }
+    // Parse a PRAGMA synchronous argument to SQLite's numeric level (OFF/NORMAL/FULL/EXTRA
+    // are 0/1/2/3), or return -1 if it isn't one of the documented keyword or numeric forms.
+    // Any other argument is the core's business alone; we shadow only what we can name.
+    static int ParseSynchronousLevel(const char *arg) {
+        for (int level = 0; level < 4; level++) {
+            if (!sqlite3_stricmp(arg, SynchronousLevelName(level))) {
+                return level;
+            }
+        }
+        if (arg[0] >= '0' && arg[0] <= '3' && !arg[1]) {
+            return arg[0] - '0';
+        }
+        return -1;
+    }
+    static const char *SynchronousLevelName(int level) {
+        static const char *const NAMES[] = {"OFF", "NORMAL", "FULL", "EXTRA"};
+        return NAMES[level];
+    }
+
+    int FileControl(int op, void *pArg) override {
+        if (op == SQLITE_FCNTL_PRAGMA && pArg) {
+            // SQLite sends this file control to the main database file as each PRAGMA
+            // statement is parsed, before acting on it; returning SQLITE_NOTFOUND lets the
+            // core apply the pragma to the inner database as usual -- we only observe. We
+            // shadow `synchronous` because the pager gives the VFS no other read of the
+            // inner level: under OFF there is not even an xSync at commit. begin() asserts
+            // the shadowed level on the outer connection (see ApplyInnerSynchronous), so an
+            // inner commit runs under the level its own connection selected.
+            char **aFcntl = (char **)pArg;
+            if (aFcntl[1] && aFcntl[2] && !sqlite3_stricmp(aFcntl[1], "synchronous") && !txn_ &&
+                !inner_lock_held_) {
+                // aFcntl[2] null (a bare `PRAGMA synchronous` query) shadows nothing. The
+                // transaction guard matters because the core refuses to change the level
+                // inside a transaction, yet this control fires before that refusal: a
+                // refused change must not enter the shadow, or the outer database would run
+                // under a level the inner connection never adopted. Buffered writes or a
+                // held lock are this file's signs of an open transaction.
+                int level = ParseSynchronousLevel(aFcntl[2]);
+                if (level >= 0) {
+                    inner_synchronous_ = level;
+                }
+            }
+        }
+        return SQLITE_NOTFOUND;
+    }
     int SectorSize() override { return 0; }
     int DeviceCharacteristics() override {
         return SQLITE_IOCAP_ATOMIC | SQLITE_IOCAP_POWERSAFE_OVERWRITE;
@@ -1097,7 +1183,7 @@ class InnerDatabaseFile : public SQLiteVFS::File {
                       bool noprefetch, bool web)
         : SQLiteVFS::File(zName), log_filename_(log_filename), outer_db_(std::move(outer_db)),
           inner_db_pages_table_(inner_db_tablename_prefix + "pages"), read_only_(read_only),
-          web_(web),
+          web_(web), outer_unsafe_(zName && sqlite3_uri_boolean(zName, "outer_unsafe", 0)),
           // MAX(pageno) instead of COUNT(pageno) because the latter would trigger table scan
           select_page_count_(*outer_db_,
                              "SELECT IFNULL(MAX(pageno), 0) FROM " + inner_db_pages_table_),
